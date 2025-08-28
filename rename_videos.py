@@ -2,12 +2,56 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo  # Python 3.9+
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
-VIDEO_EXTS = {".mov": "iphone", ".mp4": "android"}  # extension -> prefix
+FILE_EXTS = {
+    ".mov": "iphone", 
+    ".mp4": "android",
+    ".heic": "iphone",
+    ".jpg": "android",
+    ".jpeg": "android"
+}  # extension -> prefix
+
+
+def detect_device_from_metadata(path: str) -> str:
+    """
+    Detect device type from metadata using exiftool. Returns 'iphone' or 'android'.
+    Fallback to extension-based detection if metadata unavailable.
+    """
+    try:
+        cmd = ["exiftool", "-Make", "-Model", "-AndroidMake", "-AndroidModel", "-j", path]
+        out = subprocess.check_output(cmd)
+        data = json.loads(out.decode("utf-8", errors="replace"))
+        if data and len(data) > 0:
+            metadata = data[0]
+            
+            # Check all possible make/model fields
+            make = metadata.get("Make", "").lower()
+            model = metadata.get("Model", "").lower()
+            android_make = metadata.get("AndroidMake", "").lower()
+            android_model = metadata.get("AndroidModel", "").lower()
+            
+            # Check for Apple/iPhone
+            if make == "apple" or "iphone" in model:
+                return "iphone"
+            
+            # Check for Android/Google
+            if android_make or android_model or make == "google" or "pixel" in model:
+                return "android"
+                
+    except Exception:
+        pass
+    
+    # Fallback to extension-based detection
+    ext_lower = os.path.splitext(path)[1].lower()
+    if ext_lower in [".mov", ".heic"]:
+        return "iphone"
+    else:  # .mp4, .jpg, .jpeg
+        return "android"
 
 
 def run_ffprobe_datetime(path: str) -> datetime | None:
@@ -97,6 +141,13 @@ def pacific_stamp(dt_utc: datetime) -> str:
     return dt_local.strftime("%Y%m%d-%H%M%S")
 
 
+def is_already_renamed(filename: str) -> bool:
+    """Check if filename is already in yyyymmdd-hhmmss-device format."""
+    # Pattern: 8 digits, dash, 6 digits, dash, device name, extension
+    pattern = r'^\d{8}-\d{6}-(iphone|android)\.(mov|mp4|heic|jpg|jpeg)$'
+    return bool(re.match(pattern, filename, re.IGNORECASE))
+
+
 def unique_target(dirpath: str, base: str, ext: str) -> str:
     """
     Ensure the target filename is unique by appending -1, -2, ...
@@ -115,12 +166,12 @@ def unique_target(dirpath: str, base: str, ext: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Rename .mov (iPhone) and .mp4 (Android) videos based on metadata timestamp (Pacific time)."
+        description="Rename videos (.mov, .mp4) and images (.heic, .jpg, .jpeg) based on metadata timestamp (Pacific time)."
     )
-    ap.add_argument("directory", help="Path to the directory containing videos")
+    ap.add_argument("directory", help="Path to the directory containing videos and images")
     ap.add_argument("--dry-run", action="store_true", help="Show what would happen without renaming")
-    ap.add_argument("--iphone-prefix", default="iphone", help="Prefix for .mov files (default: iphone)")
-    ap.add_argument("--android-prefix", default="android", help="Prefix for .mp4 files (default: android)")
+    ap.add_argument("--iphone-prefix", default="iphone", help="Prefix for iPhone files (.mov, .heic) (default: iphone)")
+    ap.add_argument("--android-prefix", default="android", help="Prefix for Android files (.mp4, .jpg, .jpeg) (default: android)")
     args = ap.parse_args()
 
     dirpath = os.path.abspath(args.directory)
@@ -138,10 +189,18 @@ def main():
 
         root, ext = os.path.splitext(name)
         ext_lower = ext.lower()
-        if ext_lower not in VIDEO_EXTS:
+        if ext_lower not in FILE_EXTS:
             continue
 
-        prefix = args.iphone_prefix if ext_lower == ".mov" else args.android_prefix
+        # Skip if already in correct format
+        if is_already_renamed(name):
+            print(f"Skip (already renamed): {name}")
+            skipped += 1
+            continue
+
+        # Determine prefix based on metadata
+        device_type = detect_device_from_metadata(src)
+        prefix = args.iphone_prefix if device_type == "iphone" else args.android_prefix
 
         # Get timestamp (ffprobe -> mtime fallback)
         dt_utc = run_ffprobe_datetime(src)
